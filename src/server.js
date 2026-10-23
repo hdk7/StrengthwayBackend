@@ -1,0 +1,87 @@
+"use strict";
+
+const { connectDB, disconnectDB } = require("./config/database");
+const { PORT, NODE_ENV } = require("./config/env");
+const seedAdmin = require("./seeds/seed.admin");
+const app = require("./app");
+
+/**
+ * Bootstrap the HTTP server:
+ *   1. Connect to MongoDB Atlas
+ *   2. Ensure core RBAC demo accounts exist
+ *   3. Start the Express server
+ *   4. Register graceful shutdown handlers (SIGTERM, SIGINT)
+ */
+async function bootstrap() {
+  // 1. Establish database connection before accepting traffic
+  await connectDB();
+
+  // 2. Ensure default demo accounts (admin, trainer, member) exist in database
+  try {
+    await seedAdmin({ silent: false });
+  } catch (seedErr) {
+    console.warn("[Server] Notice: Seed accounts sync:", seedErr.message);
+  }
+
+  // 3. Process expired flex assignments on startup (handles downtime & catch-up)
+  const batchAssignmentService = require("./modules/batches/batchAssignment.service");
+  try {
+    const catchupResult = await batchAssignmentService.processExpiredFlexAssignments();
+    if (catchupResult?.totalProcessed > 0) {
+      console.log(
+        `[Server] Flex auto-rejoin catch-up: ${catchupResult.rejoinedCount} rejoined, ${catchupResult.activatedCount} activated.`
+      );
+    }
+  } catch (catchupErr) {
+    console.warn("[Server] Notice: Flex catch-up processing:", catchupErr.message);
+  }
+
+  // Periodic background check every 15 minutes
+  const flexCheckTimer = setInterval(() => {
+    batchAssignmentService.processExpiredFlexAssignments().catch((err) => {
+      console.error("[Server] Flex auto-rejoin periodic check error:", err.message);
+    });
+  }, 15 * 60 * 1000);
+
+  // 4. Start listening
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log("─────────────────────────────────────────────");
+    console.log(`  Strengthway API`);
+    console.log(`  ENV  : ${NODE_ENV}`);
+    console.log(`  PORT : ${PORT}`);
+    console.log(`  URL  : http://localhost:${PORT}/api/health`);
+    console.log("─────────────────────────────────────────────");
+  });
+
+  // Graceful shutdown — finish in-flight requests before closing
+  async function shutdown(signal) {
+    console.log(`\n[Server] ${signal} received. Shutting down gracefully…`);
+    clearInterval(flexCheckTimer);
+    server.close(async () => {
+      await disconnectDB();
+      console.log("[Server] Graceful shutdown complete.");
+      process.exit(0);
+    });
+
+    // Force-kill after 10 seconds if shutdown stalls
+    setTimeout(() => {
+      console.error("[Server] Forced shutdown after timeout.");
+      process.exit(1);
+    }, 10_000);
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM")); // Docker / cloud stop
+  process.on("SIGINT",  () => shutdown("SIGINT"));  // Ctrl+C in terminal
+
+  // Catch unhandled promise rejections and uncaught exceptions
+  process.on("unhandledRejection", (reason) => {
+    console.error("[Server] Unhandled Promise Rejection:", reason);
+  });
+
+  process.on("uncaughtException", (err) => {
+    console.error("[Server] Uncaught Exception:", err.message);
+    process.exit(1);
+  });
+}
+
+bootstrap();
